@@ -59,48 +59,44 @@ def get_customer_profile_data(customer_id: int):
 
     raw_profile = get_customer_profile(
         customer_id=customer_id,
-        purchase_df=state.purchase_df,
+        clean_df=state.clean_df,
         customer_features=state.customer_features,
     )
-    if not raw_profile:
+    if not raw_profile or "metrics" not in raw_profile:
         raise HTTPException(status_code=404, detail=f"Customer ID {customer_id} not found.")
 
-    # Order history
-    inv_df = (
-        state.purchase_df[state.purchase_df["CustomerID"] == customer_id]
-        .groupby("InvoiceNo")
-        .agg(
-            date=("InvoiceDate", "max"),
-            items_count=("Quantity", "sum"),
-            total_revenue=("Revenue", "sum"),
-        )
-        .sort_values("date", ascending=False)
-        .reset_index()
-    )
-    order_history = [
-        CustomerOrderItem(
-            invoice_no=row["InvoiceNo"],
-            date=str(row["date"].date()),
-            items_count=int(row["items_count"]),
-            total_revenue=round(float(row["total_revenue"]), 2),
-        )
-        for _, row in inv_df.iterrows()
-    ]
+    metrics = raw_profile["metrics"]
 
-    # Top products
+    # Order history from raw_profile orders DataFrame
+    orders_df = raw_profile.get("orders", pd.DataFrame())
+    order_history = []
+    if isinstance(orders_df, pd.DataFrame) and not orders_df.empty:
+        for _, row in orders_df.iterrows():
+            inv_date = row["InvoiceDate"]
+            date_str = str(inv_date.date()) if hasattr(inv_date, "date") else str(inv_date)
+            order_history.append(
+                CustomerOrderItem(
+                    invoice_no=str(row["InvoiceNo"]),
+                    date=date_str,
+                    items_count=int(row["Items"]),
+                    total_revenue=round(float(row["Revenue"]), 2),
+                )
+            )
+
+    # Top products from raw_profile top_products DataFrame
     top_p = raw_profile.get("top_products", pd.DataFrame())
     top_products = []
     if isinstance(top_p, pd.DataFrame) and not top_p.empty:
-        top_products = [
-            CustomerTopProduct(
-                stock_code=str(row["StockCode"]),
-                description=str(row["Description"]),
-                total_qty=int(row["TotalQty"]),
-                total_spend=round(float(row["TotalSpend"]), 2),
-                order_count=int(row["Invoices"]),
+        for _, row in top_p.iterrows():
+            top_products.append(
+                CustomerTopProduct(
+                    stock_code=str(row["StockCode"]),
+                    description=str(row.get("Description", row["StockCode"])),
+                    total_qty=int(row.get("Quantity", 0)),
+                    total_spend=round(float(row.get("Revenue", 0.0)), 2),
+                    order_count=1,
+                )
             )
-            for _, row in top_p.iterrows()
-        ]
 
     # Model predictions if trained
     badges = CustomerPredictionBadges()
@@ -132,42 +128,52 @@ def get_customer_profile_data(customer_id: int):
         )
         if pred_days is not None and not math.isnan(pred_days):
             badges.next_purchase_days = round(pred_days, 1)
-            last_date = pd.to_datetime(raw_profile["last_purchase"])
+            last_date = pd.to_datetime(metrics["last_purchase"])
             est_date = last_date + timedelta(days=float(pred_days))
             badges.next_purchase_date = str(est_date.date())
 
     # 4. Recommendations
     if state.recommender is not None:
-        recs = get_recommendations(state.recommender, customer_id=customer_id, top_n=5)
-        badges.recommended_products = [
-            {
-                "stock_code": r.stock_code,
-                "description": r.description,
-                "score": round(r.score, 3),
-                "reason": r.reason,
-            }
-            for r in recs
-        ]
+        rec_df = get_recommendations(
+            customer_id=customer_id,
+            recommender=state.recommender,
+            n=5,
+        )
+        if isinstance(rec_df, pd.DataFrame) and not rec_df.empty:
+            badges.recommended_products = [
+                {
+                    "stock_code": str(r["StockCode"]),
+                    "description": str(r.get("Description", r["StockCode"])),
+                    "score": round(float(r.get("score", 0.0)), 3),
+                    "reason": str(r.get("reason", "")),
+                }
+                for _, r in rec_df.iterrows()
+            ]
 
-    inter_order = raw_profile.get("inter_order_days")
+    inter_order = metrics.get("inter_order_days")
     if pd.isna(inter_order):
         inter_order = None
     else:
         inter_order = round(float(inter_order), 1)
 
+    first_p = metrics.get("first_purchase")
+    last_p = metrics.get("last_purchase")
+    first_p_str = str(first_p.date()) if hasattr(first_p, "date") else str(first_p)
+    last_p_str = str(last_p.date()) if hasattr(last_p, "date") else str(last_p)
+
     return CustomerProfileResponse(
-        customer_id=int(raw_profile["CustomerID"]),
-        country=str(raw_profile["country"]),
-        first_purchase=str(raw_profile["first_purchase"].date()),
-        last_purchase=str(raw_profile["last_purchase"].date()),
-        frequency=int(raw_profile["frequency"]),
-        monetary=round(float(raw_profile["monetary"]), 2),
-        avg_order_value=round(float(raw_profile["avg_order_value"]), 2),
-        avg_qty_per_order=round(float(raw_profile["avg_qty_per_order"]), 2),
-        recency=int(raw_profile["recency"]),
-        tenure_days=int(raw_profile["tenure_days"]),
-        repeat_rate=int(raw_profile["repeat_rate"]),
-        unique_products=int(raw_profile["unique_products"]),
+        customer_id=int(metrics["CustomerID"]),
+        country=str(metrics.get("country", "Unknown")),
+        first_purchase=first_p_str,
+        last_purchase=last_p_str,
+        frequency=int(metrics["frequency"]),
+        monetary=round(float(metrics["monetary"]), 2),
+        avg_order_value=round(float(metrics["avg_order_value"]), 2),
+        avg_qty_per_order=round(float(metrics["avg_qty_per_order"]), 2),
+        recency=int(metrics["recency"]),
+        tenure_days=int(metrics["tenure_days"]),
+        repeat_rate=int(metrics["repeat_rate"]),
+        unique_products=int(metrics["unique_products"]),
         inter_order_days=inter_order,
         order_history=order_history,
         top_products=top_products,
